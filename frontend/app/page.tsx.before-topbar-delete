@@ -1,0 +1,174 @@
+'use client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { CSSProperties, FormEvent } from 'react';
+import { ArrowDown, ArrowRight, AudioLines, BookOpen, BrainCircuit, Check, ChevronDown, CircleHelp, CloudUpload, FileText, Globe, Home, LayoutGrid, LoaderCircle, MessageCircle, Mic, MicOff, Paperclip, Plus, Search, Send, Settings, ShieldCheck, Sparkles, Square, Trash2, Upload, Volume2, X, Zap } from 'lucide-react';
+
+type Source = { filename: string; chunk: number; snippet: string };
+type ChatMessage = { role: 'user' | 'assistant'; content: string; sources?: Source[]; pending?: boolean };
+type Doc = { id: number; filename: string; chunks: number; created_at?: string };
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const starter: ChatMessage[] = [{ role: 'assistant', content: 'Welcome to QROYVAN. Upload a document and ask me about it, or start a live voice conversation. Iâ€™ll cite the knowledge sources I use.' }];
+
+export default function HomePage() {
+  const [page, setPage] = useState('Home');
+  const [messages, setMessages] = useState<ChatMessage[]>(starter);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [docs, setDocs] = useState<Doc[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [voiceState, setVoiceState] = useState<'idle'|'connecting'|'listening'|'speaking'|'error'>('idle');
+  const [voiceTranscript, setVoiceTranscript] = useState('');
+  const [search, setSearch] = useState('');
+  const [showSources, setShowSources] = useState(true);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const loadDocs = useCallback(async () => {
+    try { const r = await fetch(`${API}/api/documents`); if (r.ok) setDocs(await r.json()); }
+    catch { /* API may not be running during first render */ }
+  }, []);
+  useEffect(() => { void loadDocs(); }, [loadDocs]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useEffect(() => () => { void stopVoice(false); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function sendMessage(e?: FormEvent) {
+    e?.preventDefault(); const text = input.trim(); if (!text || busy) return;
+    setInput(''); setPage('Chat'); setBusy(true);
+    setMessages(prev => [...prev, { role: 'user', content: text }, { role: 'assistant', content: '', pending: true }]);
+    try {
+      const response = await fetch(`${API}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: text }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'The assistant could not answer.');
+      setMessages(prev => { const next = [...prev]; next[next.length - 1] = { role: 'assistant', content: data.answer, sources: data.sources || [] }; return next; });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Could not reach the QROYVAN API.';
+      setMessages(prev => { const next = [...prev]; next[next.length - 1] = { role: 'assistant', content: `I couldnâ€™t complete that request: ${message}. Check that the backend is running and GROQ_API_KEY is configured.` }; return next; });
+    } finally { setBusy(false); }
+  }
+
+  async function uploadFile(file?: File) {
+    if (!file) return;
+    setUploading(true); setNotice(`Indexing ${file.name}â€¦`);
+    const form = new FormData(); form.append('file', file);
+    try {
+      const r = await fetch(`${API}/api/documents`, { method: 'POST', body: form }); const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || 'Upload failed');
+      setNotice(`${data.filename} is ready for questions.`); await loadDocs(); setPage('Memory');
+    } catch (err) { setNotice(err instanceof Error ? err.message : 'Upload failed.'); }
+    finally { setUploading(false); if (fileRef.current) fileRef.current.value = ''; }
+  }
+
+  async function removeDoc(id: number) {
+    try { const r = await fetch(`${API}/api/documents/${id}`, { method: 'DELETE' }); if (!r.ok) throw new Error('Could not delete document'); await loadDocs(); setNotice('Document deleted.'); }
+    catch (err) { setNotice(err instanceof Error ? err.message : 'Delete failed'); }
+  }
+
+  async function startVoice() {
+    if (voiceState === 'connecting' || voiceState === 'listening' || voiceState === 'speaking') return;
+    setVoiceState('connecting'); setNotice(''); setPage('Chat');
+    try {
+      const tokenRes = await fetch(`${API}/api/voice/session`, { method: 'POST' }); const tokenData = await tokenRes.json();
+      if (!tokenRes.ok) throw new Error(tokenData.detail || 'Could not create voice session');
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true }); streamRef.current = stream;
+      const pc = new RTCPeerConnection(); pcRef.current = pc;
+      const audio = new Audio(); audio.autoplay = true; audioRef.current = audio;
+      pc.ontrack = event => { audio.srcObject = event.streams[0]; void audio.play().catch(() => {}); };
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+      const dc = pc.createDataChannel('oai-events'); dcRef.current = dc;
+      dc.onopen = () => { setVoiceState('listening'); setNotice('Voice connected. Speak naturally; you can interrupt the assistant.'); };
+      dc.onmessage = async event => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'response.function_call_arguments.done' && data.name === 'search_knowledge') {
+            let toolResult: unknown;
+            try {
+              const args = JSON.parse(data.arguments || '{}');
+              const toolResponse = await fetch(`${API}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: String(args.question || 'Search my uploaded knowledge') }) });
+              toolResult = await toolResponse.json();
+              if (!toolResponse.ok) toolResult = { error: (toolResult as { detail?: string }).detail || 'Knowledge search failed' };
+            } catch { toolResult = { error: 'Knowledge search failed' }; }
+            if (dc.readyState === 'open') {
+              dc.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: data.call_id, output: JSON.stringify(toolResult) } }));
+              dc.send(JSON.stringify({ type: 'response.create' }));
+            }
+            return;
+          }
+          if (data.type === 'input_audio_buffer.speech_started') setVoiceState('listening');
+          if (data.type === 'response.created') setVoiceState('speaking');
+          if (data.type === 'response.done') setVoiceState('listening');
+          if (data.type === 'conversation.item.input_audio_transcription.completed' && data.transcript) {
+            setVoiceTranscript(data.transcript);
+            setMessages(prev => [...prev, { role: 'user', content: data.transcript }]);
+          }
+          if ((data.type === 'response.output_audio_transcript.done' || data.type === 'response.output_text.done') && data.transcript || data.type === 'response.output_text.done' && data.text) {
+            const spoken = data.transcript || data.text;
+            if (spoken) setMessages(prev => [...prev, { role: 'assistant', content: spoken }]);
+          }
+        } catch { /* ignore non-JSON events */ }
+      };
+      const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+      const sdpRes = await fetch('https://api.openai.com/v1/realtime/calls', { method: 'POST', body: offer.sdp, headers: { Authorization: `Bearer ${tokenData.client_secret}`, 'Content-Type': 'application/sdp' } });
+      if (!sdpRes.ok) throw new Error(`Realtime connection failed (${sdpRes.status}): ${(await sdpRes.text()).slice(0, 220)}`);
+      await pc.setRemoteDescription({ type: 'answer', sdp: await sdpRes.text() });
+    } catch (err) {
+      await stopVoice(false); setVoiceState('error'); setNotice(err instanceof Error ? err.message : 'Could not start voice. Check microphone permission and API access.');
+    }
+  }
+
+  async function stopVoice(showNotice = true) {
+    try { if (dcRef.current?.readyState === 'open') dcRef.current.send(JSON.stringify({ type: 'session.close' })); } catch {}
+    dcRef.current?.close(); dcRef.current = null;
+    pcRef.current?.getSenders().forEach(sender => sender.track?.stop()); pcRef.current?.close(); pcRef.current = null;
+    streamRef.current?.getTracks().forEach(track => track.stop()); streamRef.current = null;
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current.srcObject = null; audioRef.current = null; }
+    setVoiceState('idle'); if (showNotice) setNotice('Voice conversation ended.');
+  }
+
+  const nav = [ { label: 'Home', icon: Home }, { label: 'Chat', icon: MessageCircle }, { label: 'Tasks', icon: Check }, { label: 'Memory', icon: BrainCircuit }, { label: 'Apps & Tools', icon: LayoutGrid }, { label: 'Settings', icon: Settings } ];
+  const filteredDocs = docs.filter(d => d.filename.toLowerCase().includes(search.toLowerCase()));
+  const orbLabel = ({ idle: 'Ready when you are', connecting: 'Connecting to voiceâ€¦', listening: 'Listening â€” go ahead', speaking: 'QROYVAN is speaking', error: 'Voice connection needs attention' } as const)[voiceState];
+
+  return <main className="app-shell">
+    <div className="backdrop" />
+    <aside className="sidebar glass-panel">
+      <button className="brand" onClick={() => setPage('Home')} aria-label="QROYVAN home"><span className="brand-orb"><span /></span><span className="brand-copy"><b>QROYVAN</b><small>AI ASSISTANT</small></span></button>
+      <nav>{nav.map(({label, icon: Icon}) => <button key={label} className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => setPage(label)}><Icon size={18}/><span>{label}</span>{label === 'Memory' && docs.length > 0 && <em>{docs.length}</em>}</button>)}</nav>
+      <div className="sidebar-bottom"><div className="quote">â€œThe best way to predict the future is to create it.â€<b>â€” QROYVAN</b></div><div className="user-pill"><div className="avatar">Q</div><div><small>Welcome back</small><strong>Guest User</strong></div><ChevronDown size={15}/></div></div>
+    </aside>
+
+    <section className="workspace">
+      <header className="topbar glass-panel"><div className="top-actions"><span className="online-dot"/><span className="online-label">System online</span><button title="Help" onClick={() => setNotice('Upload a document, ask a question, or start a voice conversation.')}><CircleHelp size={18}/></button><button title="Settings" onClick={() => setPage('Settings')}><Settings size={18}/></button></div></header>
+
+      {page === 'Home' && <div className="home-view">
+        <div className="hero-copy"><span className="eyebrow"><Sparkles size={14}/> YOUR PERSONAL KNOWLEDGE AI</span><h1>Your knowledge.<br/><span>In conversation.</span></h1><p>Ask your documents, explore ideas, get answers with sources.</p></div>
+        <div className={`orb-stage ${voiceState}`}><div className="orb-grid"/><div className="orbit orbit-one"/><div className="orbit orbit-two"/><button className="orb-button" onClick={() => voiceState === 'idle' || voiceState === 'error' ? void startVoice() : void stopVoice()} aria-label={voiceState === 'idle' ? 'Start voice conversation' : 'End voice conversation'}><div className="orb-core"><div className="orb-shine"/><div className="orb-ribbon ribbon-a"/><div className="orb-ribbon ribbon-b"/><div className="orb-ribbon ribbon-c"/></div></button><div className="orb-pedestal"><span/></div><div className="voice-callout" aria-live="polite">{voiceState === 'connecting' ? <LoaderCircle className="spin" size={22}/> : voiceState === 'listening' || voiceState === 'speaking' ? <Square size={17}/> : <AudioLines size={26}/>}<span>{voiceState === 'idle' || voiceState === 'error' ? 'Start voice conversation' : voiceState === 'connecting' ? 'Connectingâ€¦' : 'End voice conversation'}</span><ArrowRight size={17}/></div><div className="orb-status"><span className={voiceState === 'error' ? 'status-red' : ''}/>{orbLabel}</div></div>
+        <form className="prompt-bar" onSubmit={sendMessage}><Sparkles size={20}/><input value={input} onChange={e => setInput(e.target.value)} placeholder="Ask anything about your knowledge..."/><button type="button" className="icon-button" title="Upload a document" onClick={() => fileRef.current?.click()}><Paperclip size={19}/></button><button className="send-button" type="submit" disabled={!input.trim() || busy} aria-label="Send"><ArrowRight size={20}/></button></form>
+        </div>}
+
+      {page === 'Chat' && <section className="chat-view"><div className="section-heading"><div><span className="eyebrow">QROYVAN ASSISTANT</span><h2>Chat with QROYVAN</h2><p>Your thoughts, ideas and questions â€” grounded in your knowledge.</p></div><button className={`outline-button ${voiceState !== 'idle' ? 'danger' : ''}`} onClick={() => voiceState === 'idle' || voiceState === 'error' ? void startVoice() : void stopVoice()}>{voiceState === 'idle' || voiceState === 'error' ? <Mic size={16}/> : <MicOff size={16}/>} {voiceState === 'idle' || voiceState === 'error' ? 'Talk to QROYVAN' : 'End voice'}</button></div>
+        <div className="messages">{messages.map((m, i) => <div className={`message-row ${m.role}`} key={`${i}-${m.role}`}><div className={`message-avatar ${m.role}`}>{m.role === 'assistant' ? <span className="mini-orb"/> : 'Y'}</div><div className="message-body"><div className="message-name">{m.role === 'assistant' ? 'QROYVAN' : 'You'} <small>{m.pending ? 'Thinkingâ€¦' : ''}</small></div><div className={`message-bubble ${m.pending ? 'pending' : ''}`}>{m.pending ? <span className="typing"><i/><i/><i/></span> : m.content}</div>{m.sources && m.sources.length > 0 && <div className="source-list"><button className="source-toggle" onClick={() => setShowSources(!showSources)}><ShieldCheck size={14}/> {m.sources.length} knowledge sources <ChevronDown size={13} className={showSources ? '' : 'rotated'}/></button>{showSources && <div className="source-chips">{m.sources.map((s, n) => <details key={`${s.filename}-${n}`} className="source-chip"><summary><FileText size={13}/>{s.filename} Â· chunk {s.chunk}</summary><p>{s.snippet}</p></details>)}</div>}</div>}</div></div>)}<div ref={bottomRef}/></div>
+        {voiceState !== 'idle' && <div className={`voice-banner ${voiceState}`}><div className="waveform">{Array.from({length: 21}, (_,i) => <i key={i} style={{'--bar': `${10 + ((i*7)%22)}px`} as CSSProperties}/>)}</div><div><b>{orbLabel}</b><small>{voiceTranscript ? `Last heard: â€œ${voiceTranscript}â€` : 'Speak naturally. You can interrupt at any time.'}</small></div><button onClick={() => void stopVoice()}><Square size={14}/> End</button></div>}
+        <form className="chat-composer" onSubmit={sendMessage}><button type="button" title="Upload file" onClick={() => fileRef.current?.click()}><Paperclip size={18}/></button><input value={input} onChange={e => setInput(e.target.value)} placeholder="Type your message..."/><button type="button" className="mic-button" onClick={() => voiceState === 'idle' || voiceState === 'error' ? void startVoice() : void stopVoice()} title="Voice"><Mic size={18}/></button><button className="send-button" type="submit" disabled={!input.trim() || busy}><Send size={18}/></button></form>
+      </section>}
+
+      {page === 'Memory' && <section className="content-view"><div className="section-heading"><div><span className="eyebrow">YOUR PERSONAL KNOWLEDGE HUB</span><h2>Knowledge & Memory</h2><p>Upload documents and ask QROYVAN questions about their contents.</p></div><button className="primary-button" onClick={() => fileRef.current?.click()}><Plus size={17}/> Add knowledge</button></div><div className="memory-stats"><div><FileText/><b>{docs.length}</b><span>Documents</span></div><div><BrainCircuit/><b>{docs.reduce((n,d) => n+d.chunks,0)}</b><span>Indexed chunks</span></div><div><ShieldCheck/><b>RAG</b><span>Retrieval enabled</span></div></div><div className="upload-drop" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); void uploadFile(e.dataTransfer.files[0]); }}><div className="upload-icon"><Upload size={23}/></div><b>{uploading ? 'Indexing your documentâ€¦' : 'Bring your knowledge to QROYVAN'}</b><p>Drag and drop PDF, DOCX, TXT, MD, CSV or JSON files here</p><button className="outline-button" onClick={() => fileRef.current?.click()} disabled={uploading}>{uploading ? <LoaderCircle className="spin" size={16}/> : <Plus size={16}/>} Choose file</button><small>Maximum file size: 20 MB. Text is extracted and indexed for semantic search.</small></div><div className="list-heading"><h3>Your knowledge sources</h3><span>{filteredDocs.length} items</span></div><div className="document-list">{filteredDocs.length ? filteredDocs.map(d => <div className="document-row" key={d.id}><span className="doc-icon"><FileText size={20}/></span><div className="doc-meta"><b>{d.filename}</b><small>{d.chunks} indexed chunks Â· {d.created_at ? new Date(d.created_at).toLocaleDateString() : 'Recently added'}</small></div><span className="indexed"><span/> Indexed</span><button className="icon-button delete-button" title={`Delete ${d.filename}`} onClick={() => void removeDoc(d.id)}><Trash2 size={16}/></button></div>) : <div className="empty-state"><BookOpen size={28}/><b>No knowledge sources yet</b><p>Upload a document to start asking questions with citations.</p></div>}</div></section>}
+
+      {page === 'Tasks' && <section className="content-view"><div className="section-heading"><div><span className="eyebrow">YOUR WORKSPACE</span><h2>Tasks & Actions</h2><p>Keep your AI workflow organized.</p></div><button className="primary-button" onClick={() => setNotice('Task creation is a planned extension. Chat, RAG, uploads and voice are available in this starter.')}><Plus size={17}/> New task</button></div><div className="feature-grid"><div className="feature-card"><Zap/><h3>Ask your documents</h3><p>Retrieve facts and answers from indexed files.</p><button onClick={() => setPage('Memory')}>Open knowledge <ArrowRight size={14}/></button></div><div className="feature-card"><MessageCircle/><h3>Start a conversation</h3><p>Ask questions with cited source passages.</p><button onClick={() => setPage('Chat')}>Open chat <ArrowRight size={14}/></button></div><div className="feature-card"><Mic/><h3>Voice assistant</h3><p>Talk naturally and interrupt the assistant.</p><button onClick={() => void startVoice()}>Start speaking <ArrowRight size={14}/></button></div></div></section>}
+
+      {page === 'Apps & Tools' && <section className="content-view"><div className="section-heading"><div><span className="eyebrow">YOUR AI TOOLKIT</span><h2>Apps & Tools</h2><p>Useful capabilities, unified in one workspace.</p></div></div><div className="tool-grid">{[{icon:Search,name:'Knowledge Search',desc:'Find relevant passages across your files',action:()=>setPage('Memory')},{icon:MessageCircle,name:'AI Chat',desc:'Ask grounded questions and follow up',action:()=>setPage('Chat')},{icon:AudioLines,name:'Live Voice',desc:'Real-time speech-to-speech assistant',action:()=>void startVoice()},{icon:CloudUpload,name:'Document Ingestion',desc:'Upload and index your knowledge base',action:()=>fileRef.current?.click()},{icon:Globe,name:'Web Search',desc:'External web search can be added as a tool',action:()=>setNotice('Web search is not enabled in this starter; connect an approved search provider to add it.')},{icon:Settings,name:'Preferences',desc:'Review configuration and status',action:()=>setPage('Settings')}].map(({icon:Icon,name,desc,action})=><button className="tool-card" key={name} onClick={action}><span><Icon size={22}/></span><b>{name}</b><p>{desc}</p><ArrowRight size={16}/></button>)}</div></section>}
+
+      {page === 'Settings' && <section className="content-view"><div className="section-heading"><div><span className="eyebrow">PREFERENCES</span><h2>Settings</h2><p>Manage your QROYVAN setup.</p></div></div><div className="settings-card"><div className="settings-title"><span className="avatar large">Q</span><div><b>Guest workspace</b><p>Local development environment</p></div><span className="pill">Starter</span></div><div className="settings-row"><div><b>Backend API</b><small>{API}</small></div><span className="indexed"><span/> Configured URL</span></div><div className="settings-row"><div><b>Knowledge retrieval</b><small>Embeddings + PostgreSQL pgvector</small></div><span className="pill">RAG</span></div><div className="settings-row"><div><b>Voice connection</b><small>WebRTC Realtime API Â· browser microphone</small></div><span className="pill">{voiceState === 'idle' ? 'Disconnected' : voiceState}</span></div><div className="settings-note"><ShieldCheck size={18}/><p>Keep API keys on the backend. Before deploying publicly, add authentication, per-user data isolation, rate limits and HTTPS.</p></div></div></section>}
+
+      <footer className="footer"><span>QROYVAN <i>AI</i></span><span><span className="online-dot"/> Knowledge in conversation</span><span>Built for your ideas <Sparkles size={12}/></span></footer>
+    </section>
+
+    <input ref={fileRef} type="file" accept=".pdf,.docx,.txt,.md,.csv,.json" hidden onChange={e => void uploadFile(e.target.files?.[0])}/>
+    {notice && <div className="toast"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={15}/></button></div>}
+  </main>;
+}
+

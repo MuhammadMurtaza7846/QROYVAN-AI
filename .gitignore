@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+.next/
+.DS_Store
+uploads/
+.env
+.env.*
+!.env.example
+# Keep API keys private
+.env
+
